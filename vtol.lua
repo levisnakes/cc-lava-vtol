@@ -29,8 +29,9 @@ REAR_MAX = 1.0            -- most the rear thrusters may be throttled to
 
 FUEL_TANK = nil           -- the lava tank (basins drain into it, thrusters fuel from it); nil = any tank with lava
 FUEL = "minecraft:lava"
-BURNER_PUSH_MB = 250      -- lava pushed into each Liquid Burner per round (burners come first)
-BURNER_RESERVE_MB = 1000  -- while a burner still wants lava, thrusters leave this much behind
+BURNER_FUEL = "createdieselgenerators:diesel" -- what Liquid Burners get (FUEL = lava, like the thrusters)
+BURNER_PUSH_MB = 250      -- pushed into each Liquid Burner per round (burners come first)
+BURNER_RESERVE_MB = 1000  -- burners on lava only: while one still wants lava, thrusters leave this much
 LOW_FUEL_MB = 2000        -- land when the onboard tank drops below this
 LOW_THRUSTER_MB = 200     -- with no tank: land when a lift thruster drops below this
 
@@ -56,7 +57,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.4.0"
+local VERSION = "1.5.0"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -438,13 +439,19 @@ local function burnerNames()
   return out
 end
 
-local function lavaIn(name)
+-- How much of `fluid` a block holds, and whether it also holds anything else.
+local function fluidIn(name, fluid)
   local ok, tanks = pcall(peripheral.call, name, "tanks")
-  if not ok or type(tanks) ~= "table" then return nil end
-  local total = 0
-  for _, t in pairs(tanks) do if t.name == FUEL then total = total + (t.amount or 0) end end
-  return total
+  if not ok or type(tanks) ~= "table" then return nil, false end
+  local total, other = 0, false
+  for _, t in pairs(tanks) do
+    if t.name == fluid then total = total + (t.amount or 0)
+    elseif (t.amount or 0) > 0 then other = true end
+  end
+  return total, other
 end
+
+local function lavaIn(name) return (fluidIn(name, FUEL)) end
 
 local function isBasin(name)
   for _, ty in ipairs({ peripheral.getType(name) }) do
@@ -455,6 +462,7 @@ end
 
 -- Basins and the tank their lava goes into. The tank is FUEL_TANK, or the
 -- fluid block (not a basin, burner or thruster) already holding the most lava.
+-- A tank holding something else (the diesel tank) is never picked.
 local function basinsAndStore()
   local seen, basins, store, best = {}, {}, nil, -1
   for _, name in ipairs(peripheral.getNames()) do
@@ -465,8 +473,9 @@ local function basinsAndStore()
         if isBasin(name) then
           basins[#basins + 1] = name
         elseif not FUEL_TANK then
-          local mb = lavaIn(name) or 0
-          if mb > best then store, best = name, mb end
+          local mb, other = fluidIn(name, FUEL)
+          mb = mb or 0
+          if not other and mb > best then store, best = name, mb end
         end
       end
     end
@@ -513,11 +522,13 @@ local function runBasins()
 end
 
 -- Everything on the network that can hold fluid, apart from thrusters and
--- burners (they only take lava): tanks, vessels, basins. Returns the ones
--- holding lava, fullest first, and whether any fluid block was found at all.
-local function fuelSources()
+-- burners (they only take fuel): tanks, vessels, basins. Returns the ones
+-- holding `fluid` (lava by default), fullest first, and whether any fluid
+-- block was found at all.
+local function fuelSources(fluid)
+  fluid = fluid or FUEL
   local names = {}
-  if FUEL_TANK then
+  if FUEL_TANK and fluid == FUEL then
     if peripheral.isPresent(FUEL_TANK) then names[1] = FUEL_TANK end
   else
     local seen = {}
@@ -533,7 +544,7 @@ local function fuelSources()
   end
   local out = {}
   for _, name in ipairs(names) do
-    local mb = lavaIn(name)
+    local mb = fluidIn(name, fluid)
     if mb and mb > 0 then out[#out + 1] = { name = name, mb = mb } end
   end
   table.sort(out, function(a, b) return a.mb > b.mb end)
@@ -550,23 +561,29 @@ local function fuelLoop()
     F.tank = sources[1] and sources[1].name or nil
     F.sourceN = #sources
 
-    -- 1. burners first. A burner that takes a whole push is still hungry;
-    -- one that takes less is (nearly) full. A burner passes what it can't
-    -- hold to the next one in a straight line, so the end burner feeds a row.
+    -- 1. burners first, with BURNER_FUEL. A burner that takes a whole push is
+    -- still hungry; one that takes less is (nearly) full. A burner passes what
+    -- it can't hold to the next one in a straight line, so the end burner
+    -- feeds a row.
     local burners = burnerNames()
+    local shared = BURNER_FUEL == FUEL
+    local bSources = shared and sources or fuelSources(BURNER_FUEL)
+    local bTotal = 0
+    for _, s in ipairs(bSources) do bTotal = bTotal + s.mb end
     local hungry = false
-    if #sources > 0 and #burners > 0 then
+    if #bSources > 0 and #burners > 0 then
       local jobs = {}
       for _, b in ipairs(burners) do
         jobs[#jobs + 1] = function()
           local want = BURNER_PUSH_MB
-          for _, s in ipairs(sources) do
+          for _, s in ipairs(bSources) do
             if want <= 0 then break end
-            local ok, moved = pcall(peripheral.call, s.name, "pushFluid", b, want, FUEL)
+            local ok, moved = pcall(peripheral.call, s.name, "pushFluid", b, want, BURNER_FUEL)
             if ok and type(moved) == "number" then
               want = want - moved
               s.mb = s.mb - moved
-              total = total - moved
+              bTotal = bTotal - moved
+              if shared then total = total - moved end
             end
           end
           if want <= 0 then hungry = true end
@@ -575,10 +592,11 @@ local function fuelLoop()
       parallel.waitForAll(table.unpack(jobs))
     end
     F.burnerN, F.burnersHungry = #burners, hungry
+    F.burnerFuelMb = (not shared and #burners > 0) and bTotal or nil
 
-    -- 2. thrusters get the rest. While a burner is still hungry they leave
-    -- BURNER_RESERVE_MB behind for it.
-    local spare = hungry and math.max(0, total - BURNER_RESERVE_MB) or math.huge
+    -- 2. thrusters get the lava. When the burners run on lava too and one
+    -- is still hungry, thrusters leave BURNER_RESERVE_MB behind for it.
+    local spare = (shared and hungry) and math.max(0, total - BURNER_RESERVE_MB) or math.huge
     if #sources > 0 and spare > 0 then
       local jobs = {}
       for _, t in ipairs(thrusterNames()) do
@@ -649,6 +667,10 @@ local function draw()
     end
     if (F.burnerN or 0) > 0 then
       fuel = fuel .. string.format("   burners %d%s", F.burnerN, F.burnersHungry and " filling" or " full")
+      if F.burnerFuelMb then
+        local short = BURNER_FUEL:match(":(.+)$") or BURNER_FUEL
+        fuel = fuel .. string.format(" (%s %d mB)", short, math.floor(F.burnerFuelMb))
+      end
     end
     line(5, fuel, F.lowFuel and colours.red or nil)
     line(6, F.target and string.format("Target %.0f %.0f %.0f", F.target.x, F.target.y, F.target.z) or "Target -")
