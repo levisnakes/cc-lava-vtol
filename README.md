@@ -7,7 +7,7 @@ Rocket Pilot **Flight Controller (peripheral)**.
 - **Lift thrusters** (nozzles down, e.g. a pair at each corner) hold the height and tilt the plane to move sideways or brake.
 - **Rear thrusters** (nozzles out the back) push whenever the way to go is ahead of the nose.
 - The nose can't be turned (vertical and rear thrust make no yaw), so targets off to the side are reached by sliding.
-- Pushes cobble from Mechanical Generators into every basin and drains the basins into the lava tank, then feeds diesel (`BURNER_FUEL`) to the Liquid Burners and lava to every thruster, fullest source first. Lands by itself when the lava runs low.
+- Pushes cobble from Mechanical Generators into every basin and drains the basins into the lava tank, then feeds diesel to the Liquid Burner(s) picked with B (the one under the basin), lava to the other burners and to every thruster, fullest source first. Lands by itself when the lava runs low.
 
 ## Install
 
@@ -26,6 +26,7 @@ Run `vtol` (or `vtol log` to write `vtol.log`).
 | H | hover here |
 | L | land |
 | M | manual: W/S forward speed, A/D sideways, R/F up/down 5, Space stop |
+| B | pick which Liquid Burner(s) get diesel (saved) |
 | O | thrusters off |
 | Q | quit (thrusters off) |
 

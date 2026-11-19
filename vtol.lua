@@ -29,9 +29,11 @@ REAR_MAX = 1.0            -- most the rear thrusters may be throttled to
 
 FUEL_TANK = nil           -- the lava tank (basins drain into it, thrusters fuel from it); nil = any tank with lava
 FUEL = "minecraft:lava"
-BURNER_FUEL = "createdieselgenerators:diesel" -- what Liquid Burners get (FUEL = lava, like the thrusters)
+DIESEL = "createdieselgenerators:diesel"
+DIESEL_BURNERS = nil      -- burners that get diesel, e.g. { "createpropulsion:liquid_burner_block_entity_3" }; nil = the ones picked with B
+OTHER_BURNER_FUEL = "minecraft:lava" -- what every other Liquid Burner gets; nil = nothing
 BURNER_PUSH_MB = 250      -- pushed into each Liquid Burner per round (burners come first)
-BURNER_RESERVE_MB = 1000  -- burners on lava only: while one still wants lava, thrusters leave this much
+BURNER_RESERVE_MB = 1000  -- while a lava burner still wants lava, thrusters leave this much
 LOW_FUEL_MB = 2000        -- land when the onboard tank drops below this
 LOW_THRUSTER_MB = 200     -- with no tank: land when a lift thruster drops below this
 
@@ -57,7 +59,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.5.1"
+local VERSION = "1.6.0"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -436,7 +438,72 @@ local function burnerNames()
       if isBurner(name) then out[#out + 1] = name end
     end
   end
+  table.sort(out)
   return out
+end
+
+-- Which burners get diesel: DIESEL_BURNERS if set, else the ones picked with
+-- B (saved in /vtol_burners.cfg so they survive restarts and updates).
+local BURNER_FILE = "/vtol_burners.cfg"
+local dieselPicked = {}
+do
+  if fs.exists(BURNER_FILE) then
+    local f = fs.open(BURNER_FILE, "r")
+    local data = textutils.unserialize(f.readAll())
+    f.close()
+    if type(data) == "table" then for _, n in ipairs(data) do dieselPicked[n] = true end end
+  end
+end
+
+local function isDieselBurner(name)
+  if DIESEL_BURNERS then
+    for _, n in ipairs(DIESEL_BURNERS) do if n == name then return true end end
+    return false
+  end
+  return dieselPicked[name] == true
+end
+
+local function burnerNumber(name) return "#" .. (name:match("_(%d+)$") or "?") end
+
+-- B: list the burners, type the number(s) of the one(s) under the basin.
+local function pickDieselBurners()
+  local burners = burnerNames()
+  term.setBackgroundColour(colours.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("Which burner(s) get diesel?")
+  print("")
+  if #burners == 0 then
+    print("No Liquid Burners on the network.")
+    print("Press any key.")
+    os.pullEvent("char")
+    return
+  end
+  for _, b in ipairs(burners) do
+    print(burnerNumber(b) .. "  " .. b .. (isDieselBurner(b) and "  (diesel now)" or ""))
+  end
+  print("")
+  print("Type the number(s), e.g. 3 or 3 5.")
+  print("The rest get " .. (OTHER_BURNER_FUEL and (OTHER_BURNER_FUEL:match(":(.+)$") or OTHER_BURNER_FUEL) or "nothing") .. ".")
+  write("> ")
+  local picked, list = {}, {}
+  for word in (read() or ""):gmatch("%d+") do
+    for _, b in ipairs(burners) do
+      if b:match("_(%d+)$") == word and not picked[b] then
+        picked[b] = true
+        list[#list + 1] = b
+      end
+    end
+  end
+  dieselPicked = picked
+  local f = fs.open(BURNER_FILE, "w")
+  f.write(textutils.serialize(list))
+  f.close()
+  if DIESEL_BURNERS then
+    print("Note: DIESEL_BURNERS is set at the top of the file and wins over this.")
+    sleep(2)
+  end
+  F.msg = #list > 0 and ("diesel burners: " .. #list) or "no burner gets diesel"
 end
 
 -- How much of `fluid` a block holds, and whether it also holds anything else.
@@ -561,42 +628,44 @@ local function fuelLoop()
     F.tank = sources[1] and sources[1].name or nil
     F.sourceN = #sources
 
-    -- 1. burners first, with BURNER_FUEL. A burner that takes a whole push is
-    -- still hungry; one that takes less is (nearly) full. A burner passes what
-    -- it can't hold to the next one in a straight line, so the end burner
-    -- feeds a row.
+    -- 1. burners first. The diesel burners (picked with B) get DIESEL, every
+    -- other burner gets OTHER_BURNER_FUEL. A burner that takes a whole push
+    -- is still hungry; one that takes less is (nearly) full. A burner passes
+    -- what it can't hold to the next one in a straight line, so the end
+    -- burner feeds a row.
     local burners = burnerNames()
-    local shared = BURNER_FUEL == FUEL
-    local bSources = shared and sources or fuelSources(BURNER_FUEL)
-    local bTotal = 0
-    for _, s in ipairs(bSources) do bTotal = bTotal + s.mb end
-    local hungry = false
-    if #bSources > 0 and #burners > 0 then
-      local jobs = {}
-      for _, b in ipairs(burners) do
+    local dSources = fuelSources(DIESEL)
+    local dTotal = 0
+    for _, s in ipairs(dSources) do dTotal = dTotal + s.mb end
+    local hungry = false -- a lava burner still wants lava
+    local jobs = {}
+    for _, b in ipairs(burners) do
+      local fluid = isDieselBurner(b) and DIESEL or OTHER_BURNER_FUEL
+      local srcs = fluid == FUEL and sources or (fluid == DIESEL and dSources or nil)
+      if fluid and srcs and #srcs > 0 then
         jobs[#jobs + 1] = function()
           local want = BURNER_PUSH_MB
-          for _, s in ipairs(bSources) do
+          for _, s in ipairs(srcs) do
             if want <= 0 then break end
-            local ok, moved = pcall(peripheral.call, s.name, "pushFluid", b, want, BURNER_FUEL)
+            local ok, moved = pcall(peripheral.call, s.name, "pushFluid", b, want, fluid)
             if ok and type(moved) == "number" then
               want = want - moved
               s.mb = s.mb - moved
-              bTotal = bTotal - moved
-              if shared then total = total - moved end
+              if fluid == FUEL then total = total - moved end
+              if fluid == DIESEL then dTotal = dTotal - moved end
             end
           end
-          if want <= 0 then hungry = true end
+          if want <= 0 and fluid == FUEL then hungry = true end
         end
       end
-      parallel.waitForAll(table.unpack(jobs))
     end
+    if #jobs > 0 then parallel.waitForAll(table.unpack(jobs)) end
     F.burnerN, F.burnersHungry, F.burnerList = #burners, hungry, burners
-    F.burnerFuelMb = (not shared and #burners > 0) and bTotal or nil
+    F.burnerFuelMb = dTotal
 
-    -- 2. thrusters get the lava. When the burners run on lava too and one
-    -- is still hungry, thrusters leave BURNER_RESERVE_MB behind for it.
-    local spare = (shared and hungry) and math.max(0, total - BURNER_RESERVE_MB) or math.huge
+    -- 2. thrusters get the lava. While a lava burner is still hungry they
+    -- leave BURNER_RESERVE_MB behind for it.
+    local spare = hungry and math.max(0, total - BURNER_RESERVE_MB) or math.huge
     if #sources > 0 and spare > 0 then
       local jobs = {}
       for _, t in ipairs(thrusterNames()) do
@@ -666,16 +735,27 @@ local function draw()
       if (F.generatorN or 0) == 0 then fuel = fuel .. " (no cobble gen)" end
     end
     line(5, fuel, F.lowFuel and colours.red or nil)
-    -- burners on their own line, with the network number of each one fed
+    -- burners on their own line: which get diesel, which get the other fuel
     local burn = "Burners: none on network"
+    local warn = false
     if (F.burnerN or 0) > 0 then
-      local short = BURNER_FUEL:match(":(.+)$") or BURNER_FUEL
-      local ids = {}
-      for _, b in ipairs(F.burnerList or {}) do ids[#ids + 1] = "#" .. (b:match("_(%d+)$") or "?") end
-      burn = string.format("Burners %s %s, %s %d mB", table.concat(ids, " "),
-        F.burnersHungry and "filling" or "full", short, math.floor(F.burnerFuelMb or 0))
+      local dIds, oIds = {}, {}
+      for _, b in ipairs(F.burnerList or {}) do
+        if isDieselBurner(b) then dIds[#dIds + 1] = burnerNumber(b) else oIds[#oIds + 1] = burnerNumber(b) end
+      end
+      if #dIds == 0 then
+        burn = "Burners " .. table.concat(oIds, " ") .. ": press B to pick the diesel one"
+        warn = true
+      else
+        burn = string.format("Diesel %s (%d mB)", table.concat(dIds, " "), math.floor(F.burnerFuelMb or 0))
+        if #oIds > 0 then
+          local short = OTHER_BURNER_FUEL and (OTHER_BURNER_FUEL:match(":(.+)$") or OTHER_BURNER_FUEL) or "none"
+          burn = burn .. "  " .. short .. " " .. table.concat(oIds, " ")
+        end
+        warn = (F.burnerFuelMb or 0) == 0
+      end
     end
-    line(10, burn, ((F.burnerN or 0) > 0 and (F.burnerFuelMb or 1) == 0) and colours.red or nil)
+    line(10, burn, warn and colours.red or nil)
     line(6, F.target and string.format("Target %.0f %.0f %.0f", F.target.x, F.target.y, F.target.z) or "Target -")
     if F.mode == "manual" then
       line(7, string.format("Manual: forward %d  sideways %d", F.vF, F.vS), colours.cyan)
@@ -691,7 +771,7 @@ local function draw()
   end
   line(9, F.msg, colours.yellow)
   line(11, "T takeoff G goto H hover L land", colours.lightGrey)
-  line(12, "M manual O off Q quit", colours.lightGrey)
+  line(12, "M manual B burners O off Q quit", colours.lightGrey)
   term.setCursorPos(cx, cy)
 end
 
@@ -722,6 +802,11 @@ local function keyLoop()
     elseif ch == "l" then land()
     elseif ch == "m" then manual()
     elseif ch == "o" then setMode("off", "off")
+    elseif ch == "b" and F.mode ~= "manual" then
+      F.picking = true -- the flight loop stops drawing over the list
+      pcall(pickDieselBurners)
+      F.picking = false
+      term.clear()
     elseif ch == "q" then setMode("off", "quit") F.running = false
     elseif ch == "g" then
       term.setCursorPos(1, 13)
@@ -752,7 +837,7 @@ local function flightLoop()
       local ok, err = pcall(step, s)
       if not ok then F.msg = "error: " .. tostring(err) end
       n = n + 1
-      if n % 4 == 0 then draw() end
+      if n % 4 == 0 and not F.picking then draw() end
     end
   end
 end
