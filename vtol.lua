@@ -26,12 +26,10 @@ CTRL_LEVEL = 15           -- holding CTRL: rear thrust at this level (0-15) and 
 -- Flaps (PLANE mode). Typewriter keys -> this computer -> Redstone Links
 -- (on Redstone Relays) -> Analog Compact Flap Bearings. Set up with FLAPS.
 -- Bind these keys to any spare frequency on the typewriter so it sends them.
-PITCH_UP_KEY = "s"        -- elevator: nose up
-PITCH_DOWN_KEY = "w"      -- elevator: nose down
+NOSE_UP_KEY = "w"         -- elevator: nose up
+NOSE_DOWN_KEY = "s"       -- elevator: nose down
 ROLL_LEFT_KEY = "a"       -- ailerons
 ROLL_RIGHT_KEY = "d"
-YAW_LEFT_KEY = "q"        -- rudder
-YAW_RIGHT_KEY = "e"
 FLAP_LEVEL = 15           -- signal sent while a flap key is held (0-15)
 AUTO_LEVEL = false        -- start with auto-level on (AUTO LEVEL button toggles it)
 LEVEL_P = 1.5             -- auto-level: signal per degree of lean
@@ -76,7 +74,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "2.0.0"
+local VERSION = "2.0.1"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -319,16 +317,14 @@ local function throttleUp(code)
 end
 
 -- ---------------------------------------------------------------- flaps
--- Six channels, two per control surface (one per direction). Each is a
+-- Four channels, two per control surface (one per direction). Each is a
 -- redstone output - a side of this computer or of a Redstone Relay - that
 -- powers a Redstone Link transmitter (or the flap bearing directly).
 local CHANNELS = {
-  { id = "pitchUp", label = "Elevator nose UP", axis = "pitch", dir = 1, key = PITCH_UP_KEY },
-  { id = "pitchDown", label = "Elevator nose DOWN", axis = "pitch", dir = -1, key = PITCH_DOWN_KEY },
+  { id = "pitchUp", label = "Elevator nose UP", axis = "pitch", dir = 1, key = NOSE_UP_KEY },
+  { id = "pitchDown", label = "Elevator nose DOWN", axis = "pitch", dir = -1, key = NOSE_DOWN_KEY },
   { id = "rollLeft", label = "Ailerons roll LEFT", axis = "roll", dir = -1, key = ROLL_LEFT_KEY },
   { id = "rollRight", label = "Ailerons roll RIGHT", axis = "roll", dir = 1, key = ROLL_RIGHT_KEY },
-  { id = "yawLeft", label = "Rudder LEFT", axis = "yaw", dir = -1, key = YAW_LEFT_KEY },
-  { id = "yawRight", label = "Rudder RIGHT", axis = "yaw", dir = 1, key = YAW_RIGHT_KEY },
 }
 local FLAP_FILE = "/vtol_flaps.cfg"
 local flapOut = {}        -- channel id -> { relay = name or "computer", side = "top" }
@@ -341,7 +337,7 @@ do
   end
 end
 F.autoLevel = AUTO_LEVEL
-F.flap = { pitch = 0, roll = 0, yaw = 0 }   -- wanted signal per axis, -15..15
+F.flap = { pitch = 0, roll = 0 }   -- wanted signal per axis, -15..15
 
 local function saveFlaps()
   local f = fs.open(FLAP_FILE, "w")
@@ -386,7 +382,7 @@ local function planeFlaps(s, fLocal, dt)
   F.noseUp, F.rightUp = noseUp, rightUp
 
   local pilot = pilotFlaps()
-  local want = { pitch = 0, roll = 0, yaw = 0 }
+  local want = { pitch = 0, roll = 0 }
   if F.autoLevel then
     -- nose too high -> nose down; right wing high -> roll right
     want.pitch = -(LEVEL_P * (noseUp - PITCH_TRIM) + LEVEL_D * pRate)
@@ -1035,8 +1031,8 @@ local function draw()
     at(30, 16, string.format("%2d/15  SPC %d CTRL %d", level, SPACE_LEVEL, CTRL_LEVEL), colours.orange)
     if next(flapOut) then
       local function sgn(v) v = math.floor(v + 0.5) return (v > 0 and "+" or "") .. v end
-      at(2, 17, string.format("Pitch %s Roll %s Yaw %s  nose %s wing %s",
-        sgn(F.flap.pitch), sgn(F.flap.roll), sgn(F.flap.yaw), sgn(F.noseUp or 0), sgn(F.rightUp or 0)):sub(1, W - 2), colours.lightBlue)
+      at(2, 17, string.format("Flaps  pitch %s  roll %s    nose %s  wing %s",
+        sgn(F.flap.pitch), sgn(F.flap.roll), sgn(F.noseUp or 0), sgn(F.rightUp or 0)):sub(1, W - 2), colours.lightBlue)
     else
       at(2, 17, "Flaps not set up: FLAPS button (hover first)", colours.lightGrey)
     end
@@ -1289,7 +1285,7 @@ local function keyLoop()
     if ev == "char" then
       ch = a:lower()
       if ch == " " then ch = nil end -- space is handled as a held key below
-      -- in PLANE mode the flap letters only move flaps (so Q is rudder, not quit)
+      -- in PLANE mode the flap letters only move flaps
       if ch and F.mode == "plane" and keys[ch] and flapKeys()[keys[ch]] then ch = nil end
     elseif ev == "key" and throttleKeys()[a] then
       if not (F.held and F.held[a]) then throttleDown(a) draw() end
@@ -1323,7 +1319,7 @@ local function keyLoop()
       F.picking = true -- the flight loop stops drawing over the list
       pcall(burnerPicker)
       F.picking = false
-    elseif ch == "q" then setMode("off", "quit") F.running = false
+    elseif ch == "q" and F.mode ~= "plane" then setMode("off", "quit") F.running = false -- never mid-glide
     elseif ch == "g" then
       F.picking = true
       pcall(askTarget)

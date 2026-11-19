@@ -43,7 +43,7 @@ If the program stops for any reason the Flight Controller cuts every thruster af
 
 The typewriter's keys go to this computer, and the computer drives the flaps through **Redstone Links** on **Redstone Relays** (or its own sides), so auto-level can add its corrections to yours. A typewriter and the computer sending on the same frequency would fight, so the flap links are powered by the computer only.
 
-- Elevator **S** nose up / **W** nose down, ailerons **A** / **D**, rudder **Q** / **E** (bind each key to any spare frequency on the typewriter so it sends it).
+- Elevator **W** nose up / **S** nose down, ailerons **A** / **D** (bind each key to any spare frequency on the typewriter so it sends it).
 - Each direction is one channel: a Redstone Link transmitter on a relay side, paired with a receiver on that side of an **Analog Compact Flap Bearing** (signal strength = how far it turns).
 - Tap **FLAPS** (while hovering or parked) to set where each link is and **TEST** it. Turn **AUTO LEVEL** on there or in PLANE mode: it holds the wings level and the nose at `PITCH_TRIM`; a held key always wins on its axis.
 
