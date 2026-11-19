@@ -22,6 +22,21 @@ CRUISE_SPEED = 25         -- top speed for G (blocks/s)
 MANUAL_STEP = 2           -- W/S/A/D change the manual speed by this much
 SPACE_LEVEL = 10          -- holding SPACE: rear thrust at this level (0-15) and PLANE mode
 CTRL_LEVEL = 15           -- holding CTRL: rear thrust at this level (0-15) and PLANE mode
+
+-- Flaps (PLANE mode). Typewriter keys -> this computer -> Redstone Links
+-- (on Redstone Relays) -> Analog Compact Flap Bearings. Set up with FLAPS.
+-- Bind these keys to any spare frequency on the typewriter so it sends them.
+PITCH_UP_KEY = "s"        -- elevator: nose up
+PITCH_DOWN_KEY = "w"      -- elevator: nose down
+ROLL_LEFT_KEY = "a"       -- ailerons
+ROLL_RIGHT_KEY = "d"
+YAW_LEFT_KEY = "q"        -- rudder
+YAW_RIGHT_KEY = "e"
+FLAP_LEVEL = 15           -- signal sent while a flap key is held (0-15)
+AUTO_LEVEL = false        -- start with auto-level on (AUTO LEVEL button toggles it)
+LEVEL_P = 1.5             -- auto-level: signal per degree of lean
+LEVEL_D = 0.6             -- auto-level: signal per degree/second of turning
+PITCH_TRIM = 0            -- auto-level holds the nose this many degrees up
 MAX_TILT = 12             -- degrees the plane may lean to move or brake
 SAFETY_TILT = 40          -- above this it drops everything and levels out
 CLIMB_SPEED = 6
@@ -61,7 +76,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.9.0"
+local VERSION = "2.0.0"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -303,6 +318,121 @@ local function throttleUp(code)
   if F.held then F.held[code] = nil end
 end
 
+-- ---------------------------------------------------------------- flaps
+-- Six channels, two per control surface (one per direction). Each is a
+-- redstone output - a side of this computer or of a Redstone Relay - that
+-- powers a Redstone Link transmitter (or the flap bearing directly).
+local CHANNELS = {
+  { id = "pitchUp", label = "Elevator nose UP", axis = "pitch", dir = 1, key = PITCH_UP_KEY },
+  { id = "pitchDown", label = "Elevator nose DOWN", axis = "pitch", dir = -1, key = PITCH_DOWN_KEY },
+  { id = "rollLeft", label = "Ailerons roll LEFT", axis = "roll", dir = -1, key = ROLL_LEFT_KEY },
+  { id = "rollRight", label = "Ailerons roll RIGHT", axis = "roll", dir = 1, key = ROLL_RIGHT_KEY },
+  { id = "yawLeft", label = "Rudder LEFT", axis = "yaw", dir = -1, key = YAW_LEFT_KEY },
+  { id = "yawRight", label = "Rudder RIGHT", axis = "yaw", dir = 1, key = YAW_RIGHT_KEY },
+}
+local FLAP_FILE = "/vtol_flaps.cfg"
+local flapOut = {}        -- channel id -> { relay = name or "computer", side = "top" }
+do
+  if fs.exists(FLAP_FILE) then
+    local f = fs.open(FLAP_FILE, "r")
+    local data = textutils.unserialize(f.readAll())
+    f.close()
+    if type(data) == "table" then flapOut = data end
+  end
+end
+F.autoLevel = AUTO_LEVEL
+F.flap = { pitch = 0, roll = 0, yaw = 0 }   -- wanted signal per axis, -15..15
+
+local function saveFlaps()
+  local f = fs.open(FLAP_FILE, "w")
+  f.write(textutils.serialize(flapOut))
+  f.close()
+end
+
+local FLAP_KEYS = {}      -- key code -> channel, filled at start
+local function flapKeys()
+  if not next(FLAP_KEYS) then
+    for _, ch in ipairs(CHANNELS) do
+      local code = ch.key and keys[ch.key]
+      if code then FLAP_KEYS[code] = ch end
+    end
+  end
+  return FLAP_KEYS
+end
+
+-- Pilot input per axis from the flap keys held, -FLAP_LEVEL..FLAP_LEVEL;
+-- nil for an axis nobody is touching.
+local function pilotFlaps()
+  local out = {}
+  for code, on in pairs(F.held or {}) do
+    local ch = on and flapKeys()[code]
+    if ch then out[ch.axis] = (out[ch.axis] or 0) + ch.dir * FLAP_LEVEL end
+  end
+  return out
+end
+
+-- Called every flight tick in PLANE mode: pilot keys win on their axis;
+-- otherwise auto-level (if on) steers the wings level and the nose to trim.
+local function planeFlaps(s, fLocal, dt)
+  local q = s.orientation
+  local fwd = len(fLocal) > 0 and norm(fLocal) or v3(0, 0, 1)
+  local fw = rotate(q, fwd)
+  local right = norm(cross(fw, s.up))                     -- the right wing, in the world
+  local noseUp = math.deg(math.asin(clamp(fw.y, -1, 1)))
+  local rightUp = math.deg(math.asin(clamp(right.y, -1, 1)))
+  local pRate = F.prevNose and (noseUp - F.prevNose) / dt or 0
+  local rRate = F.prevRight and (rightUp - F.prevRight) / dt or 0
+  F.prevNose, F.prevRight = noseUp, rightUp
+  F.noseUp, F.rightUp = noseUp, rightUp
+
+  local pilot = pilotFlaps()
+  local want = { pitch = 0, roll = 0, yaw = 0 }
+  if F.autoLevel then
+    -- nose too high -> nose down; right wing high -> roll right
+    want.pitch = -(LEVEL_P * (noseUp - PITCH_TRIM) + LEVEL_D * pRate)
+    want.roll = LEVEL_P * rightUp + LEVEL_D * rRate
+  end
+  for axis, v in pairs(pilot) do want[axis] = v end
+  for axis, v in pairs(want) do want[axis] = clamp(v, -15, 15) end
+  F.flap = want
+end
+
+-- Signal each channel should have right now.
+local function channelLevels()
+  local out = {}
+  for _, ch in ipairs(CHANNELS) do
+    local v = (F.mode == "plane" and F.flap[ch.axis] or 0) * ch.dir
+    out[ch.id] = math.floor(clamp(v, 0, 15) + 0.5)
+  end
+  return out
+end
+
+local function writeChannel(id, level)
+  local o = flapOut[id]
+  if not o then return end
+  if o.relay == "computer" then
+    pcall(redstone.setAnalogOutput, o.side, level)
+  else
+    pcall(peripheral.call, o.relay, "setAnalogOutput", o.side, level)
+  end
+end
+
+-- Sends a channel's signal only when it changes (every tick at most).
+local flapSent = {}
+local function flapLoop()
+  while F.running do
+    if not F.testing then
+      for id, level in pairs(channelLevels()) do
+        if flapSent[id] ~= level then
+          writeChannel(id, level)
+          flapSent[id] = level
+        end
+      end
+    end
+    sleep(0.05)
+  end
+end
+
 -- ============================================================ control step
 
 local function velocityFrom(s, dt, gap)
@@ -388,6 +518,7 @@ local function step(s)
     for _, t in ipairs(rears) do cmd[t.index] = tr end
     F.rear = tr
     fc.setThrusts(cmd)
+    planeFlaps(s, fLocal, dt)
     return
   end
 
@@ -902,9 +1033,17 @@ local function draw()
     at(2, 16, "Rear thrust", colours.orange)
     bar(14, 16, 15, F.rear, colours.orange)
     at(30, 16, string.format("%2d/15  SPC %d CTRL %d", level, SPACE_LEVEL, CTRL_LEVEL), colours.orange)
+    if next(flapOut) then
+      local function sgn(v) v = math.floor(v + 0.5) return (v > 0 and "+" or "") .. v end
+      at(2, 17, string.format("Pitch %s Roll %s Yaw %s  nose %s wing %s",
+        sgn(F.flap.pitch), sgn(F.flap.roll), sgn(F.flap.yaw), sgn(F.noseUp or 0), sgn(F.rightUp or 0)):sub(1, W - 2), colours.lightBlue)
+    else
+      at(2, 17, "Flaps not set up: FLAPS button (hover first)", colours.lightGrey)
+    end
     local x = 2
     x = button(x, H - 1, "HOVER AGAIN H", colours.lime, "h")
-    button(x, H - 1, "LAND L", colours.yellow, "l")
+    x = button(x, H - 1, "LAND L", colours.yellow, "l")
+    button(x, H - 1, "AUTO LEVEL " .. (F.autoLevel and "ON" or "OFF"), F.autoLevel and colours.lime or colours.grey, "auto")
     button(2, H, "STOP O  (drops it!)", colours.red, "o")
   elseif F.mode == "manual" then
     at(2, 16, string.format("Forward %d  Sideways %d  Height %.0f", F.vF, F.vS, F.target and F.target.y or 0), colours.cyan)
@@ -927,6 +1066,7 @@ local function draw()
     x = 2
     x = button(x, H, "MANUAL M", colours.cyan, "m")
     x = button(x, H, "BURNERS B", colours.orange, "b")
+    x = button(x, H, "FLAPS P", colours.lightBlue, "p")
     button(x, H, "STOP O", colours.red, "o")
   end
 
@@ -935,6 +1075,129 @@ end
 
 -- Full-screen list of burners: tap one to switch it between diesel and the
 -- other fuel. Saved straight away. Returns when DONE is tapped.
+-- One tap on a full-screen page: returns the action of the button tapped
+-- (Enter / Backspace = "done"). `paint` draws the page and its buttons.
+local function tapPage(paint)
+  local W, H = native.getSize()
+  if screen.setVisible then screen.setVisible(false) end
+  screen.setBackgroundColour(colours.black)
+  screen.clear()
+  buttons = {}
+  paint(W, H)
+  if screen.setVisible then screen.setVisible(true) end
+  while true do
+    local ev, a, x, y = os.pullEvent()
+    if ev == "mouse_click" or ev == "monitor_touch" then
+      for _, bt in ipairs(buttons) do
+        if y == bt.y and x >= bt.x1 and x <= bt.x2 then return bt.action end
+      end
+    elseif ev == "key" and (a == keys.enter or a == keys.backspace) then
+      return "done"
+    end
+  end
+end
+
+local function header(W, text)
+  at(1, 1, string.rep(" ", W), nil, colours.orange)
+  at(2, 1, text, colours.black, colours.orange)
+end
+
+local function outputText(o)
+  if not o then return "not set" end
+  if o.relay == "computer" then return "computer " .. o.side end
+  return "relay #" .. (o.relay:match("_(%d+)$") or "?") .. " " .. o.side
+end
+
+local function relayNames()
+  local seen, out = {}, {}
+  for _, name in ipairs(peripheral.getNames()) do
+    if not seen[name] and peripheral.hasType(name, "redstone_relay") then
+      seen[name] = true
+      out[#out + 1] = name
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+-- Where one channel's link is: the computer or a relay, then a side.
+local function pickOutput(ch)
+  local relays = relayNames()
+  local where = tapPage(function(W, H)
+    header(W, ch.label .. ": WHERE?")
+    at(2, 3, "Which block is its Redstone Link touching?", colours.lightGrey)
+    button(2, 5, "THIS COMPUTER", colours.lightBlue, "computer")
+    for i, r in ipairs(relays) do
+      if 6 + i > H - 2 then break end
+      button(2, 6 + i, "RELAY #" .. (r:match("_(%d+)$") or "?"), colours.lightBlue, r)
+      at(16, 6 + i, r, colours.lightGrey)
+    end
+    if #relays == 0 then at(2, 7, "No Redstone Relays on the network.", colours.lightGrey) end
+    button(2, H, "CLEAR", colours.red, "clear")
+    button(10, H, "BACK", colours.white, "done")
+  end)
+  if where == "done" then return end
+  if where == "clear" then
+    flapOut[ch.id] = nil
+    saveFlaps()
+    return
+  end
+  local side = tapPage(function(W, H)
+    header(W, ch.label .. ": WHICH SIDE?")
+    at(2, 3, "The side of " .. (where == "computer" and "the computer" or ("relay #" .. (where:match("_(%d+)$") or "?"))), colours.lightGrey)
+    at(2, 4, "that the Redstone Link is on.", colours.lightGrey)
+    local x = 2
+    for _, sd in ipairs({ "top", "bottom", "left", "right", "front", "back" }) do
+      x = button(x, 6, sd:upper(), colours.lightBlue, sd)
+    end
+    button(2, H, "BACK", colours.white, "done")
+  end)
+  if side == "done" then return end
+  writeChannel(ch.id, 0)                -- the old output, if any, goes quiet
+  flapOut[ch.id] = { relay = where, side = side }
+  flapSent[ch.id] = nil                 -- flapLoop re-sends the new one
+  saveFlaps()
+end
+
+-- FLAPS: every channel with where it goes, TEST pulses one, AUTO LEVEL toggles.
+local function flapSetup()
+  while true do
+    local act = tapPage(function(W, H)
+      header(W, "FLAPS")
+      at(2, 3, "Tap a control to set where its link is.", colours.lightGrey)
+      for i, ch in ipairs(CHANNELS) do
+        local y = 4 + i
+        local o = flapOut[ch.id]
+        button(2, y, "TEST", o and colours.lime or colours.grey, "test:" .. ch.id)
+        local x = button(9, y, (ch.label .. string.rep(" ", 19)):sub(1, 19), colours.lightGrey, "set:" .. ch.id)
+        at(x, y, ("[" .. ch.key:upper() .. "] " .. outputText(o)):sub(1, W - x), o and colours.white or colours.red)
+      end
+      button(2, 13, "AUTO LEVEL: " .. (F.autoLevel and "ON " or "OFF"), F.autoLevel and colours.lime or colours.grey, "auto")
+      at(2, 15, "TEST sends 15 for 1 s: check the flap moves", colours.lightGrey)
+      at(2, 16, "the way its name says.", colours.lightGrey)
+      button(2, H, "DONE", colours.lime, "done")
+    end)
+    if act == "done" then return end
+    if act == "auto" then
+      F.autoLevel = not F.autoLevel
+    elseif act:sub(1, 4) == "set:" or act:sub(1, 5) == "test:" then
+      local id = act:match(":(.+)$")
+      local ch
+      for _, c in ipairs(CHANNELS) do if c.id == id then ch = c end end
+      if act:sub(1, 4) == "set:" then
+        pickOutput(ch)
+      elseif flapOut[id] then
+        F.testing = true                -- flapLoop leaves the outputs alone
+        writeChannel(id, 15)
+        sleep(1)
+        writeChannel(id, 0)
+        flapSent[id] = 0
+        F.testing = false
+      end
+    end
+  end
+end
+
 local function burnerPicker()
   while true do
     local W, H = native.getSize()
@@ -1026,9 +1289,13 @@ local function keyLoop()
     if ev == "char" then
       ch = a:lower()
       if ch == " " then ch = nil end -- space is handled as a held key below
+      -- in PLANE mode the flap letters only move flaps (so Q is rudder, not quit)
+      if ch and F.mode == "plane" and keys[ch] and flapKeys()[keys[ch]] then ch = nil end
     elseif ev == "key" and throttleKeys()[a] then
       if not (F.held and F.held[a]) then throttleDown(a) draw() end
-    elseif ev == "key_up" and throttleKeys()[a] then
+    elseif ev == "key" and F.mode == "plane" and flapKeys()[a] then
+      F.held[a] = true
+    elseif ev == "key_up" and (throttleKeys()[a] or flapKeys()[a]) then
       throttleUp(a)
       draw()
     elseif ev == "mouse_click" or ev == "monitor_touch" then
@@ -1043,7 +1310,16 @@ local function keyLoop()
     elseif ch == "l" then land()
     elseif ch == "m" then manual()
     elseif ch == "o" then setMode("off", "stopped: thrusters off")
-    elseif ch == "b" and F.mode ~= "manual" then
+    elseif ch == "auto" then
+      F.autoLevel = not F.autoLevel
+      F.msg = "auto-level " .. (F.autoLevel and "ON" or "OFF")
+    elseif ch == "p" and F.mode ~= "plane" and F.mode ~= "manual" then
+      -- not in PLANE mode: the setup pages would swallow the flying keys
+      F.picking = true
+      local ok, err = pcall(flapSetup)
+      if not ok then F.msg = "flaps: " .. tostring(err) end
+      F.picking = false
+    elseif ch == "b" and F.mode ~= "manual" and F.mode ~= "plane" then
       F.picking = true -- the flight loop stops drawing over the list
       pcall(burnerPicker)
       F.picking = false
@@ -1271,8 +1547,9 @@ term.clear()
 draw()
 
 -- whatever happens (error, Ctrl+T, Q), the thrusters are cut right away
-local okRun, runErr = pcall(parallel.waitForAny, flightLoop, keyLoop, fuelLoop, screenLoop, updateLoop)
+local okRun, runErr = pcall(parallel.waitForAny, flightLoop, keyLoop, fuelLoop, screenLoop, flapLoop, updateLoop)
 pcall(fc.setAllThrust, 0)
+for _, ch in ipairs(CHANNELS) do writeChannel(ch.id, 0) end
 if logf then logf.close() end
 term.clear()
 term.setCursorPos(1, 1)
