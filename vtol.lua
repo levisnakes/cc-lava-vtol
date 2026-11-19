@@ -27,7 +27,7 @@ DESCENT_SPEED = 4
 LAND_SPEED_LOW = 0.6      -- touchdown speed
 REAR_MAX = 1.0            -- most the rear thrusters may be throttled to
 
-FUEL_TANK = nil           -- only take fuel from this block; nil = any tank or basin with lava
+FUEL_TANK = nil           -- the lava tank (basins drain into it, thrusters fuel from it); nil = any tank with lava
 FUEL = "minecraft:lava"
 BURNER_PUSH_MB = 250      -- lava pushed into each Liquid Burner per round (burners come first)
 BURNER_RESERVE_MB = 1000  -- while a burner still wants lava, thrusters leave this much behind
@@ -56,7 +56,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.2.0"
+local VERSION = "1.3.0"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -446,6 +446,47 @@ local function lavaIn(name)
   return total
 end
 
+local function isBasin(name)
+  for _, ty in ipairs({ peripheral.getType(name) }) do
+    if type(ty) == "string" and ty:find("basin", 1, true) then return true end
+  end
+  return false
+end
+
+-- Basins and the tank their lava goes into. The tank is FUEL_TANK, or the
+-- fluid block (not a basin, burner or thruster) already holding the most lava.
+local function basinsAndStore()
+  local seen, basins, store, best = {}, {}, nil, -1
+  for _, name in ipairs(peripheral.getNames()) do
+    if not seen[name] then
+      seen[name] = true
+      if peripheral.hasType(name, "fluid_storage") and not peripheral.hasType(name, "thruster")
+        and not isBurner(name) then
+        if isBasin(name) then
+          basins[#basins + 1] = name
+        elseif not FUEL_TANK then
+          local mb = lavaIn(name) or 0
+          if mb > best then store, best = name, mb end
+        end
+      end
+    end
+  end
+  if FUEL_TANK then store = peripheral.isPresent(FUEL_TANK) and FUEL_TANK or nil end
+  return basins, store
+end
+
+-- Lava out of every basin into the tank, so mixers on board never stall full.
+local function drainBasins()
+  local basins, store = basinsAndStore()
+  F.basinN = #basins
+  if not store or #basins == 0 then return end
+  local jobs = {}
+  for _, b in ipairs(basins) do
+    jobs[#jobs + 1] = function() pcall(peripheral.call, store, "pullFluid", b, nil, FUEL) end
+  end
+  parallel.waitForAll(table.unpack(jobs))
+end
+
 -- Everything on the network that can hold fluid, apart from thrusters and
 -- burners (they only take lava): tanks, vessels, basins. Returns the ones
 -- holding lava, fullest first, and whether any fluid block was found at all.
@@ -476,6 +517,7 @@ end
 
 local function fuelLoop()
   while F.running do
+    drainBasins()
     local sources, anyTank = fuelSources()
     local total = 0
     for _, s in ipairs(sources) do total = total + s.mb end
@@ -576,6 +618,7 @@ local function draw()
     if F.tankMb then
       fuel = string.format("Fuel %d mB in %d block(s)", math.floor(F.tankMb), F.sourceN or 0)
     end
+    if (F.basinN or 0) > 0 then fuel = fuel .. "   basins " .. F.basinN end
     if (F.burnerN or 0) > 0 then
       fuel = fuel .. string.format("   burners %d%s", F.burnerN, F.burnersHungry and " filling" or " full")
     end
