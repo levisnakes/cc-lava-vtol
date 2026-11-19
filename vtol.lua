@@ -20,7 +20,8 @@
 TAKEOFF_HEIGHT = 15       -- blocks above the ground after T
 CRUISE_SPEED = 25         -- top speed for G (blocks/s)
 MANUAL_STEP = 2           -- W/S/A/D change the manual speed by this much
-SPACE_SPEED = 20          -- holding SPACE (typewriter or keyboard) flies forward at this speed
+SPACE_LEVEL = 10          -- holding SPACE: rear thrust at this level (0-15) and PLANE mode
+CTRL_LEVEL = 15           -- holding CTRL: rear thrust at this level (0-15) and PLANE mode
 MAX_TILT = 12             -- degrees the plane may lean to move or brake
 SAFETY_TILT = 40          -- above this it drops everything and levels out
 CLIMB_SPEED = 6
@@ -60,7 +61,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.8.0"
+local VERSION = "1.9.0"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -207,7 +208,7 @@ end
 
 local function setMode(m, why)
   F.mode, F.msg, F.touch = m, why or m, 0
-  if m ~= "manual" then F.spaceHeld = false end
+  if m ~= "plane" then F.held = {} end
   if m == "off" then
     F.target = nil
     pcall(fc.setAllThrust, 0)
@@ -260,29 +261,46 @@ local function manual()
   local p = here()
   F.target = v3(p.x, (F.target and F.target.y) or p.y, p.z)
   F.vF, F.vS = 0, 0
-  setMode("manual", "manual: W/S A/D R/F, hold SPACE to go")
+  setMode("manual", "manual: W/S A/D R/F, STOP to stop")
 end
 
--- Hold SPACE (on a Linked Typewriter or the keyboard): fly forward. Let go:
--- brake and hover there. Only while airborne.
-local function spaceDown()
-  if F.mode == "off" or F.mode == "land" or F.mode == "level" then
-    F.msg = "take off first, then hold SPACE"
+-- ---------------------------------------------------------------- plane mode
+-- SPACE / CTRL (Linked Typewriter or keyboard) throttle the rear thrusters and
+-- switch to PLANE mode: lift thrusters off, no height or level holding - the
+-- wings fly it. H brings the hover back at the current height.
+local THROTTLE_KEYS = {}   -- key code -> level, filled at start (keys is a CC global)
+local function throttleKeys()
+  if not next(THROTTLE_KEYS) then
+    THROTTLE_KEYS[keys.space] = SPACE_LEVEL
+    if keys.leftCtrl then THROTTLE_KEYS[keys.leftCtrl] = CTRL_LEVEL end
+    if keys.rightCtrl then THROTTLE_KEYS[keys.rightCtrl] = CTRL_LEVEL end
+  end
+  return THROTTLE_KEYS
+end
+
+-- rear throttle 0..1 from the strongest key held
+local function planeThrottle()
+  local level = 0
+  for code, on in pairs(F.held or {}) do
+    if on then level = math.max(level, throttleKeys()[code] or 0) end
+  end
+  return clamp(level / 15, 0, 1)
+end
+
+local function throttleDown(code)
+  if F.mode == "off" or F.mode == "land" then
+    F.msg = "take off first (T), then SPACE / CTRL"
     return
   end
-  if F.mode ~= "manual" then manual() end
-  F.spaceHeld = true
-  F.vF, F.vS = SPACE_SPEED, 0
-  F.msg = "SPACE held: flying forward"
+  if F.mode ~= "plane" then
+    F.held = {}
+    setMode("plane", "PLANE: hover off - H to hover again")
+  end
+  F.held[code] = true
 end
 
-local function spaceUp()
-  if not F.spaceHeld then return end
-  F.spaceHeld = false
-  if F.mode == "manual" then
-    F.vF, F.vS = 0, 0
-    F.msg = "SPACE let go: stopping"
-  end
+local function throttleUp(code)
+  if F.held then F.held[code] = nil end
 end
 
 -- ============================================================ control step
@@ -360,6 +378,19 @@ local function step(s)
   end
   F.liftN, F.rearN = #lifts, #rears
   if F.mode == "off" or not s.onShip then return end
+
+  -- PLANE: lift thrusters off, rear thrusters straight from the keys. Sent
+  -- every tick like any other mode, so the Flight Controller never times out.
+  if F.mode == "plane" then
+    local tr = planeThrottle()
+    local cmd = {}
+    for _, t in ipairs(s.thrusters) do cmd[t.index] = 0 end
+    for _, t in ipairs(rears) do cmd[t.index] = tr end
+    F.rear = tr
+    fc.setThrusts(cmd)
+    return
+  end
+
   if #lifts == 0 then setMode("off", "no lift thrusters found") return end
 
   if s.tilt > SAFETY_TILT and F.mode ~= "level" then setMode("level", string.format("tilt %.0f - levelling", s.tilt)) end
@@ -744,7 +775,7 @@ local MODE_LOOK = {
   off = { "OFF", colours.grey }, takeoff = { "TAKING OFF", colours.yellow },
   hover = { "HOVERING", colours.lime }, ["goto"] = { "FLYING", colours.lightBlue },
   land = { "LANDING", colours.yellow }, manual = { "MANUAL", colours.cyan },
-  level = { "LEVELLING", colours.red },
+  level = { "LEVELLING", colours.red }, plane = { "PLANE", colours.orange },
 }
 
 local function shortFluid(id) return id and (id:match(":(.+)$") or id) or "nothing" end
@@ -861,14 +892,22 @@ local function draw()
 
   -- what it's doing / last message
   at(2, 15, F.msg:sub(1, W - 2), colours.yellow)
-  if F.target and F.mode ~= "off" then
+  if F.target and F.mode ~= "off" and F.mode ~= "plane" then
     at(2, 16, string.format("Target %.0f %.0f %.0f", F.target.x, F.target.y, F.target.z), colours.lightGrey)
   end
 
   -- buttons
-  if F.mode == "manual" then
-    at(2, 16, string.format("Forward %d  Sideways %d  Height %.0f  %s", F.vF, F.vS, F.target and F.target.y or 0,
-      F.spaceHeld and "SPACE held" or "hold SPACE: go"), colours.cyan)
+  if F.mode == "plane" then
+    local level = math.floor(F.rear * 15 + 0.5)
+    at(2, 16, "Rear thrust", colours.orange)
+    bar(14, 16, 15, F.rear, colours.orange)
+    at(30, 16, string.format("%2d/15  SPC %d CTRL %d", level, SPACE_LEVEL, CTRL_LEVEL), colours.orange)
+    local x = 2
+    x = button(x, H - 1, "HOVER AGAIN H", colours.lime, "h")
+    button(x, H - 1, "LAND L", colours.yellow, "l")
+    button(2, H, "STOP O  (drops it!)", colours.red, "o")
+  elseif F.mode == "manual" then
+    at(2, 16, string.format("Forward %d  Sideways %d  Height %.0f", F.vF, F.vS, F.target and F.target.y or 0), colours.cyan)
     local x = 2
     x = button(x, H - 1, "FASTER W", colours.lime, "w")
     x = button(x, H - 1, "SLOWER S", colours.orange, "s")
@@ -987,10 +1026,10 @@ local function keyLoop()
     if ev == "char" then
       ch = a:lower()
       if ch == " " then ch = nil end -- space is handled as a held key below
-    elseif ev == "key" and a == keys.space then
-      if not F.spaceHeld then spaceDown() draw() end
-    elseif ev == "key_up" and a == keys.space then
-      spaceUp()
+    elseif ev == "key" and throttleKeys()[a] then
+      if not (F.held and F.held[a]) then throttleDown(a) draw() end
+    elseif ev == "key_up" and throttleKeys()[a] then
+      throttleUp(a)
       draw()
     elseif ev == "mouse_click" or ev == "monitor_touch" then
       for _, bt in ipairs(buttons) do
@@ -1039,15 +1078,18 @@ local function flightLoop()
   end
 end
 
--- True unless a Linked Typewriter says SPACE is not held (or is gone). A
--- missed key_up must never leave the plane flying off on its own.
-local function typewriterStillHolding()
+-- Throttle keys the Linked Typewriter says are no longer held. A missed
+-- key_up must never leave the rear thrusters running on their own.
+local function releasedOnTypewriter()
   local tw = peripheral.find("linked_typewriter")
-  if not tw or not tw.getPressedKeyCodes then return true end
+  if not tw or not tw.getPressedKeyCodes then return {} end
   local ok, codes = pcall(tw.getPressedKeyCodes)
-  if not ok or type(codes) ~= "table" then return true end
-  for _, c in pairs(codes) do if c == keys.space then return true end end
-  return false
+  if not ok or type(codes) ~= "table" then return {} end
+  local down = {}
+  for _, c in pairs(codes) do down[c] = true end
+  local gone = {}
+  for code in pairs(F.held or {}) do if not down[code] then gone[#gone + 1] = code end end
+  return gone
 end
 
 -- Redraws twice a second even when no flight data comes in (fuel, burners).
@@ -1056,7 +1098,8 @@ local function screenLoop()
   while F.running do
     sleep(0.5)
     local tw = peripheral.find("linked_typewriter") ~= nil
-    if F.spaceHeld and ((hadTypewriter and not tw) or not typewriterStillHolding()) then spaceUp() end
+    if hadTypewriter and not tw then F.held = {} end -- typewriter unplugged: let go of everything
+    for _, code in ipairs(releasedOnTypewriter()) do throttleUp(code) end
     hadTypewriter = tw
     if not F.picking then draw() end
   end
