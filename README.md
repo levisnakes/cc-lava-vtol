@@ -7,7 +7,7 @@ Rocket Pilot **Flight Controller (peripheral)**.
 - **Lift thrusters** (nozzles down, e.g. a pair at each corner) hold the height and tilt the plane to move sideways or brake.
 - **Rear thrusters** (nozzles out the back) push whenever the way to go is ahead of the nose.
 - The nose can't be turned (vertical and rear thrust make no yaw), so targets off to the side are reached by sliding.
-- Keeps every thruster topped up from any tank, vessel or basin with lava on the network (fullest first) and lands by itself when the lava runs low.
+- Feeds lava from any tank, vessel or basin on the network (fullest first): Liquid Burners first, then every thruster. Lands by itself when the lava runs low.
 
 ## Install
 
