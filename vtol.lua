@@ -27,7 +27,7 @@ DESCENT_SPEED = 4
 LAND_SPEED_LOW = 0.6      -- touchdown speed
 REAR_MAX = 1.0            -- most the rear thrusters may be throttled to
 
-FUEL_TANK = nil           -- onboard lava tank name; nil = find it
+FUEL_TANK = nil           -- only take fuel from this block; nil = any tank or basin with lava
 FUEL = "minecraft:lava"
 LOW_FUEL_MB = 2000        -- land when the onboard tank drops below this
 LOW_THRUSTER_MB = 200     -- with no tank: land when a lift thruster drops below this
@@ -54,7 +54,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -75,7 +75,7 @@ local F = {                        -- flight state, shared by the loops
   vF = 0, vS = 0,                  -- manual speeds (forward, sideways)
   st = nil, vel = nil, prevPos = nil, lastTime = nil,
   rear = 0, liftN = 0, rearN = 0, maxTiltSeen = 0,
-  tank = nil, tankMb = nil, lowFuel = false,
+  tank = nil, tankMb = nil, sourceN = 0, lowFuel = false,
   running = true,
 }
 local logf = nil
@@ -215,6 +215,11 @@ end
 local function takeOff()
   local p = here()
   if not p or not F.st.onShip then F.msg = "not on a ship" return end
+  local hover = F.st.hoverThrottle
+  if hover and hover > 0.95 then
+    F.msg = string.format("too heavy: hovering needs %d%% of the lift thrusters", math.floor(hover * 100 + 0.5))
+    return
+  end
   local h = F.st.heightAboveGround or 0
   if F.mode == "off" then F.integ = 0 end
   F.target = v3(p.x, p.y - h + TAKEOFF_HEIGHT, p.z)
@@ -312,16 +317,12 @@ local function step(s)
   end
   F.lastTime = s.time
   velocityFrom(s, dt, gap)
-  if F.mode == "off" or not s.onShip then return end
-
-  if s.tilt > SAFETY_TILT and F.mode ~= "level" then setMode("level", string.format("tilt %.0f - levelling", s.tilt)) end
-  if F.mode == "level" and s.tilt < 5 then hoverHere() end
-  F.maxTiltSeen = math.max(F.maxTiltSeen, s.tilt)
 
   -- sort thrusters: lift pushes along ship up, forward pushes level
+  -- (also while off, so the screen shows the wiring before take-off)
   local lifts, rears = {}, {}
   local fLocal = v3()
-  for _, t in ipairs(s.thrusters) do
+  for _, t in ipairs(s.thrusters or {}) do
     if t.direction.y > 0.7 then lifts[#lifts + 1] = t
     elseif math.abs(t.direction.y) < 0.3 then
       rears[#rears + 1] = t
@@ -329,7 +330,12 @@ local function step(s)
     end
   end
   F.liftN, F.rearN = #lifts, #rears
+  if F.mode == "off" or not s.onShip then return end
   if #lifts == 0 then setMode("off", "no lift thrusters found") return end
+
+  if s.tilt > SAFETY_TILT and F.mode ~= "level" then setMode("level", string.format("tilt %.0f - levelling", s.tilt)) end
+  if F.mode == "level" and s.tilt < 5 then hoverHere() end
+  F.maxTiltSeen = math.max(F.maxTiltSeen, s.tilt)
 
   local g, m, q, up = s.gravity, s.mass, s.orientation, s.up
   local p, v = s.position, F.vel
@@ -399,20 +405,6 @@ end
 
 -- ============================================================ fuel
 
-local function findTank()
-  if FUEL_TANK and peripheral.isPresent(FUEL_TANK) then return FUEL_TANK end
-  local seen = {}
-  for _, name in ipairs(peripheral.getNames()) do
-    if not seen[name] then
-      seen[name] = true
-      if peripheral.hasType(name, "fluid_storage") and not peripheral.hasType(name, "thruster") then
-        return name
-      end
-    end
-  end
-  return nil
-end
-
 local function thrusterNames()
   local seen, out = {}, {}
   for _, name in ipairs(peripheral.getNames()) do
@@ -432,18 +424,54 @@ local function lavaIn(name)
   return total
 end
 
+-- Everything on the network that can hold fluid, apart from thrusters:
+-- tanks, vessels, basins, burners. Returns the ones holding lava, fullest
+-- first, and whether any fluid block was found at all.
+local function fuelSources()
+  local names = {}
+  if FUEL_TANK then
+    if peripheral.isPresent(FUEL_TANK) then names[1] = FUEL_TANK end
+  else
+    local seen = {}
+    for _, name in ipairs(peripheral.getNames()) do
+      if not seen[name] then
+        seen[name] = true
+        if peripheral.hasType(name, "fluid_storage") and not peripheral.hasType(name, "thruster") then
+          names[#names + 1] = name
+        end
+      end
+    end
+  end
+  local out = {}
+  for _, name in ipairs(names) do
+    local mb = lavaIn(name)
+    if mb and mb > 0 then out[#out + 1] = { name = name, mb = mb } end
+  end
+  table.sort(out, function(a, b) return a.mb > b.mb end)
+  return out, #names > 0
+end
+
 local function fuelLoop()
   while F.running do
-    F.tank = findTank()
-    F.tankMb = F.tank and lavaIn(F.tank) or nil
-    if F.tank then
+    local sources, anyTank = fuelSources()
+    local total = 0
+    for _, s in ipairs(sources) do total = total + s.mb end
+    F.tankMb = anyTank and total or nil
+    F.tank = sources[1] and sources[1].name or nil
+    F.sourceN = #sources
+    if #sources > 0 then
       local jobs = {}
       for _, t in ipairs(thrusterNames()) do
         jobs[#jobs + 1] = function()
           local okA, amount = pcall(peripheral.call, t, "getFuelAmountMb")
           local okC, cap = pcall(peripheral.call, t, "getFuelCapacityMb")
-          if okA and okC and type(amount) == "number" and cap > amount then
-            pcall(peripheral.call, t, "pullFluid", F.tank, cap - amount, FUEL)
+          if not (okA and okC and type(amount) == "number") then return end
+          local space = cap - amount
+          -- take from the fullest source first, then the next, until full
+          for _, s in ipairs(sources) do
+            if space <= 0 then break end
+            local ok, moved = pcall(peripheral.call, t, "pullFluid", s.name, space, FUEL)
+            if ok and type(moved) == "number" then space = space - moved end
           end
         end
       end
@@ -489,7 +517,10 @@ local function draw()
     line(4, string.format("Lift %d   rear %d at %d%%   hover %s", F.liftN, F.rearN, math.floor(F.rear * 100 + 0.5),
       s.hoverThrottle and string.format("%d%%", math.floor(s.hoverThrottle * 100 + 0.5)) or "?"),
       (s.hoverThrottle or 0) > 0.85 and colours.red or nil)
-    local fuel = F.tankMb and string.format("Fuel tank %d mB", math.floor(F.tankMb)) or "Fuel tank: none on network"
+    local fuel = "Fuel: no tank or basin on network"
+    if F.tankMb then
+      fuel = string.format("Fuel %d mB in %d block(s)", math.floor(F.tankMb), F.sourceN or 0)
+    end
     line(5, fuel, F.lowFuel and colours.red or nil)
     line(6, F.target and string.format("Target %.0f %.0f %.0f", F.target.x, F.target.y, F.target.z) or "Target -")
     if F.mode == "manual" then
