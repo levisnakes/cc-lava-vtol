@@ -56,7 +56,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.3.0"
+local VERSION = "1.4.0"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -475,16 +475,41 @@ local function basinsAndStore()
   return basins, store
 end
 
--- Lava out of every basin into the tank, so mixers on board never stall full.
-local function drainBasins()
-  local basins, store = basinsAndStore()
-  F.basinN = #basins
-  if not store or #basins == 0 then return end
-  local jobs = {}
-  for _, b in ipairs(basins) do
-    jobs[#jobs + 1] = function() pcall(peripheral.call, store, "pullFluid", b, nil, FUEL) end
+-- Create Cobblestone Mechanical Generators: a one-slot inventory from any side.
+local function generatorNames()
+  local seen, out = {}, {}
+  for _, name in ipairs(peripheral.getNames()) do
+    if not seen[name] then
+      seen[name] = true
+      for _, ty in ipairs({ peripheral.getType(name) }) do
+        if type(ty) == "string" and ty:find("mechanical_generator", 1, true) then
+          out[#out + 1] = name
+          break
+        end
+      end
+    end
   end
-  parallel.waitForAll(table.unpack(jobs))
+  return out
+end
+
+-- Cobble from the generators into every basin (a basin holds 64), and lava
+-- out of every basin into the tank, so mixers on board never stall.
+local function runBasins()
+  local basins, store = basinsAndStore()
+  local gens = generatorNames()
+  F.basinN, F.generatorN = #basins, #gens
+  if #basins == 0 then return end
+  local jobs = {}
+  for i, b in ipairs(basins) do
+    if #gens > 0 then
+      local gen = gens[(i - 1) % #gens + 1]
+      jobs[#jobs + 1] = function() pcall(peripheral.call, gen, "pushItems", b, 1, 64) end
+    end
+    if store then
+      jobs[#jobs + 1] = function() pcall(peripheral.call, store, "pullFluid", b, nil, FUEL) end
+    end
+  end
+  if #jobs > 0 then parallel.waitForAll(table.unpack(jobs)) end
 end
 
 -- Everything on the network that can hold fluid, apart from thrusters and
@@ -517,7 +542,7 @@ end
 
 local function fuelLoop()
   while F.running do
-    drainBasins()
+    runBasins()
     local sources, anyTank = fuelSources()
     local total = 0
     for _, s in ipairs(sources) do total = total + s.mb end
@@ -618,7 +643,10 @@ local function draw()
     if F.tankMb then
       fuel = string.format("Fuel %d mB in %d block(s)", math.floor(F.tankMb), F.sourceN or 0)
     end
-    if (F.basinN or 0) > 0 then fuel = fuel .. "   basins " .. F.basinN end
+    if (F.basinN or 0) > 0 then
+      fuel = fuel .. "   basins " .. F.basinN
+      if (F.generatorN or 0) == 0 then fuel = fuel .. " (no cobble gen)" end
+    end
     if (F.burnerN or 0) > 0 then
       fuel = fuel .. string.format("   burners %d%s", F.burnerN, F.burnersHungry and " filling" or " full")
     end
