@@ -57,7 +57,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.5.0"
+local VERSION = "1.5.1"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -591,7 +591,7 @@ local function fuelLoop()
       end
       parallel.waitForAll(table.unpack(jobs))
     end
-    F.burnerN, F.burnersHungry = #burners, hungry
+    F.burnerN, F.burnersHungry, F.burnerList = #burners, hungry, burners
     F.burnerFuelMb = (not shared and #burners > 0) and bTotal or nil
 
     -- 2. thrusters get the lava. When the burners run on lava too and one
@@ -665,14 +665,17 @@ local function draw()
       fuel = fuel .. "   basins " .. F.basinN
       if (F.generatorN or 0) == 0 then fuel = fuel .. " (no cobble gen)" end
     end
-    if (F.burnerN or 0) > 0 then
-      fuel = fuel .. string.format("   burners %d%s", F.burnerN, F.burnersHungry and " filling" or " full")
-      if F.burnerFuelMb then
-        local short = BURNER_FUEL:match(":(.+)$") or BURNER_FUEL
-        fuel = fuel .. string.format(" (%s %d mB)", short, math.floor(F.burnerFuelMb))
-      end
-    end
     line(5, fuel, F.lowFuel and colours.red or nil)
+    -- burners on their own line, with the network number of each one fed
+    local burn = "Burners: none on network"
+    if (F.burnerN or 0) > 0 then
+      local short = BURNER_FUEL:match(":(.+)$") or BURNER_FUEL
+      local ids = {}
+      for _, b in ipairs(F.burnerList or {}) do ids[#ids + 1] = "#" .. (b:match("_(%d+)$") or "?") end
+      burn = string.format("Burners %s %s, %s %d mB", table.concat(ids, " "),
+        F.burnersHungry and "filling" or "full", short, math.floor(F.burnerFuelMb or 0))
+    end
+    line(10, burn, ((F.burnerN or 0) > 0 and (F.burnerFuelMb or 1) == 0) and colours.red or nil)
     line(6, F.target and string.format("Target %.0f %.0f %.0f", F.target.x, F.target.y, F.target.z) or "Target -")
     if F.mode == "manual" then
       line(7, string.format("Manual: forward %d  sideways %d", F.vF, F.vS), colours.cyan)
@@ -684,6 +687,7 @@ local function draw()
   else
     line(2, "Not on a ship (assemble it)", colours.red)
     for y = 3, 8 do line(y, "") end
+    line(10, "")
   end
   line(9, F.msg, colours.yellow)
   line(11, "T takeoff G goto H hover L land", colours.lightGrey)
