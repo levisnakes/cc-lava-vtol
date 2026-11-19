@@ -59,7 +59,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.6.0"
+local VERSION = "1.7.0"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -465,45 +465,19 @@ end
 
 local function burnerNumber(name) return "#" .. (name:match("_(%d+)$") or "?") end
 
--- B: list the burners, type the number(s) of the one(s) under the basin.
-local function pickDieselBurners()
-  local burners = burnerNames()
-  term.setBackgroundColour(colours.black)
-  term.clear()
-  term.setCursorPos(1, 1)
-  print("Which burner(s) get diesel?")
-  print("")
-  if #burners == 0 then
-    print("No Liquid Burners on the network.")
-    print("Press any key.")
-    os.pullEvent("char")
-    return
-  end
-  for _, b in ipairs(burners) do
-    print(burnerNumber(b) .. "  " .. b .. (isDieselBurner(b) and "  (diesel now)" or ""))
-  end
-  print("")
-  print("Type the number(s), e.g. 3 or 3 5.")
-  print("The rest get " .. (OTHER_BURNER_FUEL and (OTHER_BURNER_FUEL:match(":(.+)$") or OTHER_BURNER_FUEL) or "nothing") .. ".")
-  write("> ")
-  local picked, list = {}, {}
-  for word in (read() or ""):gmatch("%d+") do
-    for _, b in ipairs(burners) do
-      if b:match("_(%d+)$") == word and not picked[b] then
-        picked[b] = true
-        list[#list + 1] = b
-      end
-    end
-  end
-  dieselPicked = picked
+local function saveDieselPicks()
+  local list = {}
+  for name, on in pairs(dieselPicked) do if on then list[#list + 1] = name end end
+  table.sort(list)
   local f = fs.open(BURNER_FILE, "w")
   f.write(textutils.serialize(list))
   f.close()
-  if DIESEL_BURNERS then
-    print("Note: DIESEL_BURNERS is set at the top of the file and wins over this.")
-    sleep(2)
-  end
-  F.msg = #list > 0 and ("diesel burners: " .. #list) or "no burner gets diesel"
+  return #list
+end
+
+local function setDieselPick(name, on)
+  dieselPicked[name] = on or nil
+  return saveDieselPicks()
 end
 
 -- How much of `fluid` a block holds, and whether it also holds anything else.
@@ -705,74 +679,247 @@ end
 
 -- ============================================================ screen + keys
 
-local function draw()
-  local W = term.getSize()
-  local cx, cy = term.getCursorPos()
-  local function line(y, text, colour)
-    term.setCursorPos(1, y)
-    term.clearLine()
-    if colour and term.isColour() then term.setTextColour(colour) end
-    term.write(text:sub(1, W))
-    term.setTextColour(colours.white)
+-- Drawing goes to an off-screen window that is shown in one go, so the
+-- screen never flickers. Buttons drawn this frame are remembered for clicks.
+local native = term.current()
+local screen = (window and window.create) and window.create(native, 1, 1, native.getSize()) or native
+local buttons = {}
+
+-- colours on an Advanced Computer, white-on-black on a plain one
+local function C(c) if native.isColour() then return c end return (c == colours.black) and c or colours.white end
+
+local function at(x, y, text, fg, bg)
+  screen.setCursorPos(x, y)
+  if bg then screen.setBackgroundColour(C(bg)) end
+  if fg then screen.setTextColour(C(fg)) end
+  screen.write(text)
+  screen.setBackgroundColour(colours.black)
+  screen.setTextColour(colours.white)
+end
+
+-- a bar of `w` cells filled to `frac` (0..1)
+local function bar(x, y, w, frac, colour)
+  frac = clamp(frac or 0, 0, 1)
+  local n = math.floor(frac * w + 0.5)
+  if native.isColour() then
+    at(x, y, string.rep(" ", n), nil, colour)
+    at(x + n, y, string.rep(" ", w - n), nil, colours.grey)
+  else
+    at(x, y, string.rep("#", n) .. string.rep("-", w - n))
   end
+end
+
+local function button(x, y, label, bg, action)
+  local text = " " .. label .. " "
+  at(x, y, text, colours.black, bg)
+  buttons[#buttons + 1] = { x1 = x, x2 = x + #text - 1, y = y, action = action }
+  return x + #text + 1
+end
+
+local MODE_LOOK = {
+  off = { "OFF", colours.grey }, takeoff = { "TAKING OFF", colours.yellow },
+  hover = { "HOVERING", colours.lime }, ["goto"] = { "FLYING", colours.lightBlue },
+  land = { "LANDING", colours.yellow }, manual = { "MANUAL", colours.cyan },
+  level = { "LEVELLING", colours.red },
+}
+
+local function shortFluid(id) return id and (id:match(":(.+)$") or id) or "nothing" end
+
+-- Everything that stops a good flight, in plain words, worst first.
+local function problems()
+  local out = {}
   local s = F.st
-  line(1, "Lava VTOL " .. VERSION .. " - " .. F.mode:upper(), F.mode == "off" and colours.grey or colours.orange)
+  if not s or not s.onShip then
+    out[#out + 1] = "Not on a ship: assemble it first"
+    return out
+  end
+  if F.liftN == 0 then out[#out + 1] = "No lift thrusters: nozzles must point down + be wired" end
+  local un = s.unwiredThrusterCount or 0
+  if un > 0 then out[#out + 1] = un .. " thruster(s) not wired to the Flight Controller" end
+  if s.hoverThrottle and s.hoverThrottle > 0.95 then
+    out[#out + 1] = string.format("Too heavy: needs %d%% lift, max is 100%%", math.floor(s.hoverThrottle * 100 + 0.5))
+  end
+  if F.tankMb == nil then out[#out + 1] = "No lava tank on the network"
+  elseif F.lowFuel then out[#out + 1] = "Lava is low: refill the tank" end
+  if (F.burnerN or 0) > 0 then
+    local any = false
+    for _, b in ipairs(F.burnerList or {}) do if isDieselBurner(b) then any = true end end
+    if not any then out[#out + 1] = "Tap BURNERS and pick the basin's burner"
+    elseif (F.burnerFuelMb or 0) == 0 then out[#out + 1] = "No diesel in any tank" end
+  end
+  if (F.basinN or 0) > 0 and (F.generatorN or 0) == 0 then out[#out + 1] = "No cobble generator wired to the basin" end
+  return out
+end
+
+local function draw()
+  local W, H = native.getSize()
+  if screen.setVisible then screen.setVisible(false) end
+  screen.setBackgroundColour(colours.black)
+  screen.clear()
+  buttons = {}
+  local s = F.st
+
+  -- header: name on the left, what it's doing on the right
+  at(1, 1, string.rep(" ", W), nil, colours.orange)
+  at(2, 1, "LAVA VTOL " .. VERSION, colours.black, colours.orange)
+  local look = MODE_LOOK[F.mode] or { F.mode:upper(), colours.grey }
+  at(W - #look[1] - 2, 1, " " .. look[1] .. " ", colours.black, look[2])
+
+  local mid = math.floor(W / 2) + 1
   if s and s.onShip then
     local v = F.vel or v3()
-    line(2, string.format("Height %.1f   ground %s", s.position.y,
-      s.heightAboveGround and string.format("%.1f", s.heightAboveGround) or "?"))
-    line(3, string.format("Speed %.1f   climb %+.1f   tilt %.1f", len(v), v.y, s.tilt),
-      s.tilt > 25 and colours.red or nil)
-    line(4, string.format("Lift %d   rear %d at %d%%   hover %s", F.liftN, F.rearN, math.floor(F.rear * 100 + 0.5),
-      s.hoverThrottle and string.format("%d%%", math.floor(s.hoverThrottle * 100 + 0.5)) or "?"),
-      (s.hoverThrottle or 0) > 0.85 and colours.red or nil)
-    local fuel = "Fuel: no tank or basin on network"
+    -- flight (left)
+    at(2, 3, "FLIGHT", colours.orange)
+    at(2, 4, string.format("Height %6.1f m", s.heightAboveGround or 0))
+    at(2, 5, string.format("Speed  %6.1f m/s", len(v)))
+    at(2, 6, string.format("Climb  %+6.1f m/s", v.y))
+    at(2, 7, string.format("Tilt   %6.1f deg", s.tilt), s.tilt > 25 and colours.red or nil)
+    local need = s.hoverThrottle or 0
+    at(2, 8, "Lift needed", need > 0.95 and colours.red or nil)
+    bar(14, 8, mid - 20, need, need > 0.95 and colours.red or (need > 0.8 and colours.orange or colours.lime))
+    at(mid - 5, 8, string.format("%3d%%", math.floor(need * 100 + 0.5)), need > 0.95 and colours.red or nil)
+
+    -- fuel (right)
+    local bw = W - mid - 16
+    at(mid, 3, "FUEL", colours.orange)
+    at(mid, 4, "Lava")
+    bar(mid + 7, 4, bw, (F.tankMb or 0) / 32000, F.lowFuel and colours.red or colours.orange)
     if F.tankMb then
-      fuel = string.format("Fuel %d mB in %d block(s)", math.floor(F.tankMb), F.sourceN or 0)
-    end
-    if (F.basinN or 0) > 0 then
-      fuel = fuel .. "   basins " .. F.basinN
-      if (F.generatorN or 0) == 0 then fuel = fuel .. " (no cobble gen)" end
-    end
-    line(5, fuel, F.lowFuel and colours.red or nil)
-    -- burners on their own line: which get diesel, which get the other fuel
-    local burn = "Burners: none on network"
-    local warn = false
-    if (F.burnerN or 0) > 0 then
-      local dIds, oIds = {}, {}
-      for _, b in ipairs(F.burnerList or {}) do
-        if isDieselBurner(b) then dIds[#dIds + 1] = burnerNumber(b) else oIds[#oIds + 1] = burnerNumber(b) end
-      end
-      if #dIds == 0 then
-        burn = "Burners " .. table.concat(oIds, " ") .. ": press B to pick the diesel one"
-        warn = true
-      else
-        burn = string.format("Diesel %s (%d mB)", table.concat(dIds, " "), math.floor(F.burnerFuelMb or 0))
-        if #oIds > 0 then
-          local short = OTHER_BURNER_FUEL and (OTHER_BURNER_FUEL:match(":(.+)$") or OTHER_BURNER_FUEL) or "none"
-          burn = burn .. "  " .. short .. " " .. table.concat(oIds, " ")
-        end
-        warn = (F.burnerFuelMb or 0) == 0
-      end
-    end
-    line(10, burn, warn and colours.red or nil)
-    line(6, F.target and string.format("Target %.0f %.0f %.0f", F.target.x, F.target.y, F.target.z) or "Target -")
-    if F.mode == "manual" then
-      line(7, string.format("Manual: forward %d  sideways %d", F.vF, F.vS), colours.cyan)
+      at(mid + 8 + bw, 4, tostring(math.floor(F.tankMb)), F.lowFuel and colours.red or colours.white)
     else
-      line(7, "")
+      at(mid + 8 + bw, 4, "none", colours.red)
     end
-    local un = s.unwiredThrusterCount or 0
-    line(8, un > 0 and (un .. " thruster(s) not wired to the Flight Controller") or "", colours.red)
-  else
-    line(2, "Not on a ship (assemble it)", colours.red)
-    for y = 3, 8 do line(y, "") end
-    line(10, "")
+    at(mid, 5, "Diesel")
+    bar(mid + 7, 5, bw, (F.burnerFuelMb or 0) / 32000, colours.yellow)
+    at(mid + 8 + bw, 5, tostring(math.floor(F.burnerFuelMb or 0)))
+    if (F.basinN or 0) > 0 then
+      local gens = (F.generatorN or 0) > 0
+      at(mid, 6, "Basins " .. F.basinN .. "  cobble " .. (gens and "on" or "OFF"), gens and colours.white or colours.red)
+    else
+      at(mid, 6, "Basins none", colours.lightGrey)
+    end
+    local dIds, oIds = {}, {}
+    for _, b in ipairs(F.burnerList or {}) do
+      if isDieselBurner(b) then dIds[#dIds + 1] = burnerNumber(b) else oIds[#oIds + 1] = burnerNumber(b) end
+    end
+    local burn = "Burners none"
+    if #dIds > 0 or #oIds > 0 then
+      burn = "Burners"
+      if #dIds > 0 then burn = burn .. " " .. table.concat(dIds, " ") .. " diesel" end
+      if #oIds > 0 then burn = burn .. " " .. table.concat(oIds, " ") .. " " .. shortFluid(OTHER_BURNER_FUEL) end
+    end
+    at(mid, 7, burn:sub(1, W - mid))
+
+    -- thrusters
+    local liftAvg, n = 0, 0
+    for _, t in ipairs(s.thrusters or {}) do
+      if t.direction.y > 0.7 then liftAvg, n = liftAvg + (t.throttle or 0), n + 1 end
+    end
+    liftAvg = n > 0 and liftAvg / n or 0
+    at(2, 10, "THRUSTERS", colours.orange)
+    at(13, 10, "lift " .. F.liftN, F.liftN == 0 and colours.red or nil)
+    bar(21, 10, 8, liftAvg, colours.lime)
+    at(31, 10, "rear " .. F.rearN)
+    bar(39, 10, math.max(W - 40, 4), F.rear, colours.lightBlue)
   end
-  line(9, F.msg, colours.yellow)
-  line(11, "T takeoff G goto H hover L land", colours.lightGrey)
-  line(12, "M manual B burners O off Q quit", colours.lightGrey)
-  term.setCursorPos(cx, cy)
+
+  -- problems, or the all-clear
+  local list = problems()
+  if #list == 0 then
+    at(2, 12, "All good", colours.lime)
+  else
+    for i = 1, math.min(#list, 3) do
+      local text = list[i]
+      if i == 3 and #list > 3 then text = text .. "  (+" .. (#list - 3) .. " more)" end
+      at(2, 11 + i, ("! " .. text):sub(1, W - 2), colours.red)
+    end
+  end
+
+  -- what it's doing / last message
+  at(2, 15, F.msg:sub(1, W - 2), colours.yellow)
+  if F.target and F.mode ~= "off" then
+    at(2, 16, string.format("Target %.0f %.0f %.0f", F.target.x, F.target.y, F.target.z), colours.lightGrey)
+  end
+
+  -- buttons
+  if F.mode == "manual" then
+    at(2, 16, string.format("Forward %d  Sideways %d  Height %.0f", F.vF, F.vS, F.target and F.target.y or 0), colours.cyan)
+    local x = 2
+    x = button(x, H - 1, "FASTER W", colours.lime, "w")
+    x = button(x, H - 1, "SLOWER S", colours.orange, "s")
+    x = button(x, H - 1, "LEFT A", colours.lightBlue, "a")
+    button(x, H - 1, "RIGHT D", colours.lightBlue, "d")
+    x = 2
+    x = button(x, H, "UP R", colours.lightGrey, "r")
+    x = button(x, H, "DOWN F", colours.lightGrey, "f")
+    x = button(x, H, "STOP", colours.yellow, " ")
+    button(x, H, "DONE", colours.white, "h")
+  else
+    local x = 2
+    x = button(x, H - 1, "TAKE OFF T", colours.lime, "t")
+    x = button(x, H - 1, "HOVER H", colours.lightBlue, "h")
+    x = button(x, H - 1, "GO TO G", colours.lightBlue, "g")
+    button(x, H - 1, "LAND L", colours.yellow, "l")
+    x = 2
+    x = button(x, H, "MANUAL M", colours.cyan, "m")
+    x = button(x, H, "BURNERS B", colours.orange, "b")
+    button(x, H, "STOP O", colours.red, "o")
+  end
+
+  if screen.setVisible then screen.setVisible(true) end
+end
+
+-- Full-screen list of burners: tap one to switch it between diesel and the
+-- other fuel. Saved straight away. Returns when DONE is tapped.
+local function burnerPicker()
+  while true do
+    local W, H = native.getSize()
+    local burners = burnerNames()
+    if screen.setVisible then screen.setVisible(false) end
+    screen.setBackgroundColour(colours.black)
+    screen.clear()
+    buttons = {}
+    at(1, 1, string.rep(" ", W), nil, colours.orange)
+    at(2, 1, "WHICH BURNER GETS DIESEL?", colours.black, colours.orange)
+    at(2, 3, "Tap the burner under the basin.", colours.lightGrey)
+    at(2, 4, "The rest get " .. shortFluid(OTHER_BURNER_FUEL) .. ".", colours.lightGrey)
+    if #burners == 0 then
+      at(2, 6, "No Liquid Burners on the network.", colours.red)
+      at(2, 7, "Give each a wired modem, right-click it red.", colours.lightGrey)
+    end
+    for i, b in ipairs(burners) do
+      local y = 5 + i
+      if y > H - 2 then break end
+      local on = isDieselBurner(b)
+      local label = on and "DIESEL" or shortFluid(OTHER_BURNER_FUEL):sub(1, 6):upper()
+      button(2, y, label .. string.rep(" ", 6 - #label), on and colours.yellow or colours.grey, "toggle:" .. b)
+      at(14, y, burnerNumber(b) .. "  " .. (b:gsub("^createpropulsion:", "")), on and colours.yellow or nil)
+    end
+    if DIESEL_BURNERS then at(2, H - 2, "DIESEL_BURNERS in the file wins over this", colours.red) end
+    button(2, H, "DONE", colours.lime, "done")
+    if screen.setVisible then screen.setVisible(true) end
+
+    local ev, a, x, y = os.pullEvent()
+    local act
+    if ev == "mouse_click" or ev == "monitor_touch" then
+      for _, bt in ipairs(buttons) do
+        if y == bt.y and x >= bt.x1 and x <= bt.x2 then act = bt.action end
+      end
+    elseif ev == "key" and (a == keys.enter or a == keys.backspace) then
+      act = "done"
+    elseif ev == "char" and tonumber(a) and burners[tonumber(a)] then
+      act = "toggle:" .. burners[tonumber(a)]
+    end
+    if act == "done" then
+      local n = 0
+      for _, b in ipairs(burners) do if isDieselBurner(b) then n = n + 1 end end
+      F.msg = n > 0 and (n .. " burner(s) on diesel") or "no burner gets diesel"
+      return
+    elseif act and act:sub(1, 7) == "toggle:" then
+      local name = act:sub(8)
+      setDieselPick(name, not isDieselBurner(name))
+    end
+  end
 end
 
 local function parseTarget(text)
@@ -793,29 +940,48 @@ local function parseTarget(text)
   return out[1], out[2], out[3]
 end
 
+-- Asks for the go-to target on the message line.
+local function askTarget()
+  native.setCursorPos(1, 15)
+  native.setBackgroundColour(colours.black)
+  native.clearLine()
+  native.setTextColour(C(colours.yellow))
+  native.write(" Go to x z (or x y z, ~ = from here): ")
+  native.setTextColour(colours.white)
+  native.setCursorBlink(true)
+  local text = read() or ""
+  native.setCursorBlink(false)
+  local x, y, z = parseTarget(text)
+  if x then goTo(x, y, z) elseif text ~= "" then F.msg = "Need 2 or 3 numbers, like 120 -340" end
+end
+
 local function keyLoop()
   while F.running do
-    local _, ch = os.pullEvent("char")
-    ch = ch:lower()
-    if ch == "t" then takeOff()
+    local ev, a, x, y = os.pullEvent()
+    local ch
+    if ev == "char" then
+      ch = a:lower()
+    elseif ev == "mouse_click" or ev == "monitor_touch" then
+      for _, bt in ipairs(buttons) do
+        if y == bt.y and x >= bt.x1 and x <= bt.x2 then ch = bt.action end
+      end
+    end
+    if not ch then
+      -- not a key or button press
+    elseif ch == "t" then takeOff()
     elseif ch == "h" then hoverHere()
     elseif ch == "l" then land()
     elseif ch == "m" then manual()
-    elseif ch == "o" then setMode("off", "off")
+    elseif ch == "o" then setMode("off", "stopped: thrusters off")
     elseif ch == "b" and F.mode ~= "manual" then
       F.picking = true -- the flight loop stops drawing over the list
-      pcall(pickDieselBurners)
+      pcall(burnerPicker)
       F.picking = false
-      term.clear()
     elseif ch == "q" then setMode("off", "quit") F.running = false
     elseif ch == "g" then
-      term.setCursorPos(1, 13)
-      term.clearLine()
-      term.write("go to x z (or x y z): ")
-      local x, y, z = parseTarget(read() or "")
-      term.setCursorPos(1, 13)
-      term.clearLine()
-      if x then goTo(x, y, z) else F.msg = "need 2 or 3 numbers, ~ = relative" end
+      F.picking = true
+      pcall(askTarget)
+      F.picking = false
     elseif F.mode == "manual" then
       if ch == "w" then F.vF = math.min(F.vF + MANUAL_STEP, CRUISE_SPEED)
       elseif ch == "s" then F.vF = math.max(F.vF - MANUAL_STEP, -6)
@@ -825,7 +991,7 @@ local function keyLoop()
       elseif ch == "f" then F.target.y = F.target.y - 5
       elseif ch == " " then F.vF, F.vS = 0, 0 end
     end
-    draw()
+    if ch then draw() end
   end
 end
 
@@ -839,6 +1005,14 @@ local function flightLoop()
       n = n + 1
       if n % 4 == 0 and not F.picking then draw() end
     end
+  end
+end
+
+-- Redraws twice a second even when no flight data comes in (fuel, burners).
+local function screenLoop()
+  while F.running do
+    sleep(0.5)
+    if not F.picking then draw() end
   end
 end
 
@@ -1008,7 +1182,7 @@ term.clear()
 draw()
 
 -- whatever happens (error, Ctrl+T, Q), the thrusters are cut right away
-local okRun, runErr = pcall(parallel.waitForAny, flightLoop, keyLoop, fuelLoop, updateLoop)
+local okRun, runErr = pcall(parallel.waitForAny, flightLoop, keyLoop, fuelLoop, screenLoop, updateLoop)
 pcall(fc.setAllThrust, 0)
 if logf then logf.close() end
 term.clear()

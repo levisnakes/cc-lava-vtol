@@ -17,7 +17,13 @@ wget https://raw.githubusercontent.com/levisnakes/cc-lava-vtol/main/vtol.lua vto
 
 Wiring: a wired modem on every thruster, on the Flight Controller and on this computer, all on the same cables, every modem right-clicked red. For refuelling, each thruster's modem must be on its intake end, and the onboard tank needs a modem too.
 
-Run `vtol` (or `vtol log` to write `vtol.log`).
+Run `vtol` (or `vtol log` to write `vtol.log`). Tap the buttons on screen (Advanced Computer) or use the keys.
+
+![Flight screen](docs/screen.png)
+
+Anything stopping a good flight shows in red under the panels, in plain words. Tap **BURNERS** to choose which Liquid Burner gets diesel:
+
+![Burner picker](docs/burners.png)
 
 | Key | |
 |---|---|
