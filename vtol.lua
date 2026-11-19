@@ -20,6 +20,7 @@
 TAKEOFF_HEIGHT = 15       -- blocks above the ground after T
 CRUISE_SPEED = 25         -- top speed for G (blocks/s)
 MANUAL_STEP = 2           -- W/S/A/D change the manual speed by this much
+SPACE_SPEED = 20          -- holding SPACE (typewriter or keyboard) flies forward at this speed
 MAX_TILT = 12             -- degrees the plane may lean to move or brake
 SAFETY_TILT = 40          -- above this it drops everything and levels out
 CLIMB_SPEED = 6
@@ -59,7 +60,7 @@ end
 
 -- ============================================================ setup
 
-local VERSION = "1.7.0"
+local VERSION = "1.8.0"
 local args = { ... }
 if args[1] == "log" then LOG = true end
 
@@ -206,6 +207,7 @@ end
 
 local function setMode(m, why)
   F.mode, F.msg, F.touch = m, why or m, 0
+  if m ~= "manual" then F.spaceHeld = false end
   if m == "off" then
     F.target = nil
     pcall(fc.setAllThrust, 0)
@@ -258,7 +260,29 @@ local function manual()
   local p = here()
   F.target = v3(p.x, (F.target and F.target.y) or p.y, p.z)
   F.vF, F.vS = 0, 0
-  setMode("manual", "manual: W/S A/D R/F, space stops")
+  setMode("manual", "manual: W/S A/D R/F, hold SPACE to go")
+end
+
+-- Hold SPACE (on a Linked Typewriter or the keyboard): fly forward. Let go:
+-- brake and hover there. Only while airborne.
+local function spaceDown()
+  if F.mode == "off" or F.mode == "land" or F.mode == "level" then
+    F.msg = "take off first, then hold SPACE"
+    return
+  end
+  if F.mode ~= "manual" then manual() end
+  F.spaceHeld = true
+  F.vF, F.vS = SPACE_SPEED, 0
+  F.msg = "SPACE held: flying forward"
+end
+
+local function spaceUp()
+  if not F.spaceHeld then return end
+  F.spaceHeld = false
+  if F.mode == "manual" then
+    F.vF, F.vS = 0, 0
+    F.msg = "SPACE let go: stopping"
+  end
 end
 
 -- ============================================================ control step
@@ -843,7 +867,8 @@ local function draw()
 
   -- buttons
   if F.mode == "manual" then
-    at(2, 16, string.format("Forward %d  Sideways %d  Height %.0f", F.vF, F.vS, F.target and F.target.y or 0), colours.cyan)
+    at(2, 16, string.format("Forward %d  Sideways %d  Height %.0f  %s", F.vF, F.vS, F.target and F.target.y or 0,
+      F.spaceHeld and "SPACE held" or "hold SPACE: go"), colours.cyan)
     local x = 2
     x = button(x, H - 1, "FASTER W", colours.lime, "w")
     x = button(x, H - 1, "SLOWER S", colours.orange, "s")
@@ -852,7 +877,7 @@ local function draw()
     x = 2
     x = button(x, H, "UP R", colours.lightGrey, "r")
     x = button(x, H, "DOWN F", colours.lightGrey, "f")
-    x = button(x, H, "STOP", colours.yellow, " ")
+    x = button(x, H, "STOP", colours.yellow, "stop")
     button(x, H, "DONE", colours.white, "h")
   else
     local x = 2
@@ -961,6 +986,12 @@ local function keyLoop()
     local ch
     if ev == "char" then
       ch = a:lower()
+      if ch == " " then ch = nil end -- space is handled as a held key below
+    elseif ev == "key" and a == keys.space then
+      if not F.spaceHeld then spaceDown() draw() end
+    elseif ev == "key_up" and a == keys.space then
+      spaceUp()
+      draw()
     elseif ev == "mouse_click" or ev == "monitor_touch" then
       for _, bt in ipairs(buttons) do
         if y == bt.y and x >= bt.x1 and x <= bt.x2 then ch = bt.action end
@@ -989,7 +1020,7 @@ local function keyLoop()
       elseif ch == "a" then F.vS = math.max(F.vS - MANUAL_STEP, -8)
       elseif ch == "r" then F.target.y = F.target.y + 5
       elseif ch == "f" then F.target.y = F.target.y - 5
-      elseif ch == " " then F.vF, F.vS = 0, 0 end
+      elseif ch == "stop" then F.vF, F.vS = 0, 0 end
     end
     if ch then draw() end
   end
@@ -1008,10 +1039,25 @@ local function flightLoop()
   end
 end
 
+-- True unless a Linked Typewriter says SPACE is not held (or is gone). A
+-- missed key_up must never leave the plane flying off on its own.
+local function typewriterStillHolding()
+  local tw = peripheral.find("linked_typewriter")
+  if not tw or not tw.getPressedKeyCodes then return true end
+  local ok, codes = pcall(tw.getPressedKeyCodes)
+  if not ok or type(codes) ~= "table" then return true end
+  for _, c in pairs(codes) do if c == keys.space then return true end end
+  return false
+end
+
 -- Redraws twice a second even when no flight data comes in (fuel, burners).
 local function screenLoop()
+  local hadTypewriter = false
   while F.running do
     sleep(0.5)
+    local tw = peripheral.find("linked_typewriter") ~= nil
+    if F.spaceHeld and ((hadTypewriter and not tw) or not typewriterStillHolding()) then spaceUp() end
+    hadTypewriter = tw
     if not F.picking then draw() end
   end
 end

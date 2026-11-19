@@ -31,8 +31,9 @@ Anything stopping a good flight shows in red under the panels, in plain words. T
 | G | go to `x z` or `x y z` (`~` = relative) |
 | H | hover here |
 | L | land |
-| M | manual: W/S forward speed, A/D sideways, R/F up/down 5, Space stop |
+| M | manual: W/S forward speed, A/D sideways, R/F up/down 5, STOP button stops |
 | B | pick which Liquid Burner(s) get diesel (saved) |
+| SPACE (hold) | fly forward at `SPACE_SPEED`; let go to stop. Works from a Linked Typewriter on the network (bind SPACE to a frequency) or the keyboard |
 | O | thrusters off |
 | Q | quit (thrusters off) |
 
